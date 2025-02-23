@@ -27,7 +27,7 @@ import time
 from dataset import DatasetScaler, level_set_function, c_wind_obstruction_complex
 from pinn import PINN_Bayesian
     
-train_model = False
+train_model = True
 n_epochs = 16000
 learning_rate = 1e-3
 predictive_cost = True
