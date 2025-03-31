@@ -22,7 +22,7 @@ matching_idx = gdf_roads_raw.sindex.query(combined_geom, predicate="intersects")
 gdf_roads_clipped = gdf_roads_raw.iloc[matching_idx]
 
 gdf_roads_clipped.to_file("clipped_osm_roads.geojson", driver="GeoJSON")
-print("✅ Saved clipped road layer.")
+print("Saved clipped road layer.")
 
 
 

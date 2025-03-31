@@ -1,23 +1,25 @@
-import requests, zipfile, io, os
 import geopandas as gpd
 import rasterio
 from rasterio.mask import mask
 import json
 
-fire_geojson_path = "fire_extent.geojson"
-gdf = gpd.read_file(fire_geojson_path)
+# Load your area of interest geometry
+aoi_geojson_path = "fire_extent.geojson"
+gdf = gpd.read_file(aoi_geojson_path)
 
-nlcd_img_path = "nlcd_2019/nlcd_2019_land_cover_l48_20210604.img"
-with rasterio.open(nlcd_img_path) as src:
-    print("Raster CRS:", src.crs)
-    print("Fire extent CRS:", gdf.crs)
+# Path to the downloaded FBFM13 GeoTIFF
+fbfm13_tif_path = "LF2023_FBFM13_240_CONUS/Tif/LC23_F13_240.tif"
 
+# Open the FBFM13 raster
+with rasterio.open(fbfm13_tif_path) as src:
+    # Ensure the CRS matches between the raster and the vector data
     if gdf.crs != src.crs:
         gdf = gdf.to_crs(src.crs)
-        print("Reprojected fire extent to match raster CRS.")
 
+    # Prepare the geometry for masking
     geom = [json.loads(gdf.to_json())["features"][0]["geometry"]]
 
+    # Clip the raster using the geometry
     out_image, out_transform = mask(src, geom, crop=True)
     out_meta = src.meta.copy()
     out_meta.update({
@@ -26,7 +28,8 @@ with rasterio.open(nlcd_img_path) as src:
         "transform": out_transform
     })
 
-output_path = "clipped_nlcd.tif"
+# Save the clipped raster
+output_path = "clipped_fbfm13.tif"
 with rasterio.open(output_path, "w", **out_meta) as dest:
     dest.write(out_image)
 
