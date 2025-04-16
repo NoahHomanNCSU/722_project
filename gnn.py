@@ -10,7 +10,9 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import rasterio
 from sklearn.feature_extraction.image import extract_patches_2d
+from skimage.util import view_as_blocks
 from scipy.sparse import csr_matrix
+import gc
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -127,64 +129,44 @@ def visualize_fire_data(data, day, grid_size=10):
     plt.show()
 
 
-def raster_to_graph(day, patch_size=1, clip_bounds=None):
-    """
-    Convert raster data to graph nodes, with optional clipping.
-    
-    Args:
-        day (str): Day identifier (e.g., "08")
-        patch_size (int): Size of each patch (default: 1x1 pixel)
-        clip_bounds (tuple): (left, bottom, right, top) in raster coordinates
-    
-    Returns:
-        X (np.ndarray): Node features [mean_fuel, mean_wind_mag, mean_wind_dir]
-        y (np.ndarray): Binary damage labels
-    """
+def raster_to_tiles(day, patch_size):
+    """Memory-efficient version using block processing"""
     with rasterio.open(f"fire_inputs_2025_01_{day}.tif") as src:
-        # Clip the raster if bounds are provided
-        if clip_bounds:
-            left, bottom, right, top = clip_bounds
-            window = src.window(left, bottom, right, top)
-            fuel = src.read(1, window=window)
-            wind_mag = src.read(2, window=window)
-            wind_dir = src.read(3, window=window)
-            damage = src.read(4, window=window)
-        else:
-            fuel = src.read(1)
-            wind_mag = src.read(2)
-            wind_dir = src.read(3)
-            damage = src.read(4)
-
-    # Handle edge cases where patch_size > clipped array size
-    if patch_size > min(fuel.shape):
-        raise ValueError(f"Patch size {patch_size} is larger than clipped raster dimensions {fuel.shape}")
-
-    # Extract patches (nodes)
-    def safe_extract(data, size):
-        try:
-            return extract_patches_2d(data, (size, size))
-        except ValueError:
-            # Pad if needed (reflect mode avoids edge artifacts)
-            pad_width = ((0, size - data.shape[0] % size), (0, size - data.shape[1] % size))
-            padded = np.pad(data, pad_width, mode='reflect')
-            return extract_patches_2d(padded, (size, size))
-
-    patches_fuel = safe_extract(fuel, patch_size)
-    patches_wind_mag = safe_extract(wind_mag, patch_size)
-    patches_wind_dir = safe_extract(wind_dir, patch_size)
-    patches_damage = safe_extract(damage, patch_size)
-
-    # Node features: [mean_fuel, mean_wind_mag, mean_wind_dir]
-    X = np.stack([
-        patches_fuel.mean(axis=(1, 2)),
-        patches_wind_mag.mean(axis=(1, 2)),
-        patches_wind_dir.mean(axis=(1, 2))
-    ], axis=1)
-
-    # Node targets: Binary damage (1 if any pixel in patch is burned)
-    y = (patches_damage.max(axis=(1, 2)) > 0).astype(int)
-
+        # Read all bands with trimming
+        fuel = src.read(1)[:-454, 519:]  # Remove first 9 columns from all rows
+        wind_mag = src.read(2)[:-454, 519:]
+        wind_dir = src.read(3)[:-454, 519:]        
+        damage = src.read(4)[:-454, 519:]
+    
+    # Calculate number of patches
+    n_rows = fuel.shape[0] // patch_size
+    n_cols = fuel.shape[1] // patch_size
+    n_patches = n_rows * n_cols
+    
+    # Pre-allocate arrays
+    X = np.zeros((n_patches, 3), dtype=np.float32)
+    y = np.zeros(n_patches, dtype=np.uint8)
+    
+    # Process in blocks
+    for i, (fuel_patch, mag_patch, dir_patch, damage_patch) in enumerate(zip(
+        view_as_blocks(fuel, (patch_size, patch_size)),
+        view_as_blocks(wind_mag, (patch_size, patch_size)),
+        view_as_blocks(wind_dir, (patch_size, patch_size)),
+        view_as_blocks(damage, (patch_size, patch_size))
+    )):
+        X[i] = [
+            fuel_patch.mean(),
+            mag_patch.mean(), 
+            dir_patch.mean()
+        ]
+        y[i] = (damage_patch.max() > 0)
+        
+        # Free memory every 1000 patches
+        if i % 1000 == 0:
+            gc.collect()
+    
     return X, y
+
 
 def build_static_adjacency(patch_grid_shape=(1, 1), neighborhood=8):
     """Create a static adjacency matrix for a grid of patches."""
@@ -209,6 +191,105 @@ def build_static_adjacency(patch_grid_shape=(1, 1), neighborhood=8):
 
     return csr_matrix(adj)
 
+def create_subgraphs(X_day1, y_day1, subgraph_size=100):
+    """Split the large graph into smaller subgraphs with 50% overlap between adjacent subgraphs."""
+    # Create the adjacency matrix for the subgraph (same for every subgraph).
+    adj_matrix = build_static_adjacency(
+        patch_grid_shape=(subgraph_size, subgraph_size),
+        neighborhood=8
+    )
+    edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
+
+    # Define stride as half the subgraph size for 50% overlap.
+    stride = subgraph_size // 2
+    n_rows, n_cols = X_day1.shape[0], X_day1.shape[1]
+    subgraphs = []
+
+    # Calculate maximum starting indices to avoid slicing beyond the boundaries.
+    max_row_start = n_rows - subgraph_size + 1
+    max_col_start = n_cols - subgraph_size + 1
+
+    # Use a sliding window approach with a stride equal to half of subgraph_size.
+    for i in range(0, max_row_start, stride):
+        for j in range(0, max_col_start, stride):
+            # Define the subgraph boundaries.
+            x_end = i + subgraph_size
+            y_end = j + subgraph_size
+
+            # Extract the 100x100 subsection with the given overlap.
+            X_sub = X_day1[i:x_end, j:y_end]
+            y_sub = y_day1[i:x_end, j:y_end]
+
+            # Flatten features and labels.
+            X_flat = X_sub.reshape(-1, 3)  # 3 features per node.
+            y_flat = y_sub.reshape(-1)
+
+            subgraphs.append(Data(
+                x=torch.FloatTensor(X_flat),
+                edge_index=edge_index,
+                y=torch.FloatTensor(y_flat)
+            ))
+
+    return subgraphs
+
+
+# Modified training function
+def train_on_subgraphs(subgraphs, epochs=5, lr=0.005):
+    train_data, test_data = train_test_split(subgraphs, test_size=0.2, random_state=42)
+    # Create DataLoader
+    train_loader = DataLoader(train_data, batch_size=1, shuffle=True)
+    test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
+    
+    # Initialize model (using first subgraph's dimensions)
+    num_features = subgraphs[0].x.shape[1]
+    model = FireSpreadGAT(num_features=num_features, hidden_channels=32, num_heads=4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.BCELoss()
+    
+    for epoch in range(epochs):
+        model.train()
+        
+        for data in train_loader:
+            y = np.squeeze(data.y)
+            optimizer.zero_grad()
+            out = np.squeeze(model(data))
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+        
+        if (epoch + 1) % 1 == 0:
+            print(f'Epoch {epoch+1}/{epochs}, Loss: {loss.item():.6f}')
+            gc.collect()
+
+        if loss.item() < 0.0005:
+            print(f"Early stopping at epoch {epoch+1} with loss {loss:.6f}")
+            break
+            # Free memory every 1000 batches   
+    
+    # Evaluation
+    model.eval()
+    y_true, y_pred = [], []
+    
+    with torch.no_grad():
+        for data in test_loader:
+            pred = model(data)
+            y_true.extend(data.y.view(-1).tolist())
+            y_pred.extend((pred > 0.5).float().view(-1).tolist())
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    
+    print(f'\nTest Metrics:')
+    print(f'Accuracy: {accuracy:.4f}')
+    print(f'Precision: {precision:.4f}')
+    print(f'Recall: {recall:.4f}')
+    print(f'F1 Score: {f1:.4f}')
+    
+    return model
+    
 # 2. GAT Model Architecture
 class FireSpreadGAT(nn.Module):
     def __init__(self, num_features, hidden_channels, num_heads, dropout=0.2):
@@ -307,20 +388,34 @@ if __name__ == "__main__":
     # print(f"Predicted fire spread for {prediction.shape[0]} areas:")
     # print(f"Number of areas predicted to catch fire: {(prediction > 0.5).sum().item()}")
 
-    # Example for 2 consecutive days
-    X_day1, y_day1 = raster_to_graph("08", patch_size=1, clip_bounds=(-118.501, 34, -118.5, 34.009))
-    # X_day2, y_day2 = raster_to_graph("09")
+    # # Example for 2 consecutive days
+    # X_day1, y_day1 = raster_to_tiles("08", patch_size=10)
+    # # X_day2, y_day2 = raster_to_graph("09")
 
-    adj_matrix = build_static_adjacency(patch_grid_shape=(X_day1.shape[0], X_day1.shape[1]), neighborhood=8)
-    edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
+    # adj_matrix = build_static_adjacency(patch_grid_shape=(X_day1.shape[0], X_day1.shape[1]), neighborhood=8)
+    # edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
 
-    data = Data(
-        x=torch.tensor(X_day1, dtype=torch.float),
-        edge_index=edge_index,
-        y=torch.tensor(y_day1, dtype=torch.float)
-    )
+    # data = Data(
+    #     x=torch.tensor(X_day1, dtype=torch.float),
+    #     edge_index=edge_index,
+    #     y=torch.tensor(y_day1, dtype=torch.float)
+    # )
+
+    ##### Y should be fire on day 2, X should include fire on day 1
+    ##### get rid of subgraphs with zero damage
+
+    # Process full dataset
+    X_day1, y_day1 = raster_to_tiles("08", patch_size=10)
+    
+    # Reshape to 2D grid (1300x1900 nodes)
+    X_grid = X_day1.reshape(1300, 1900, 3)
+    y_grid = y_day1.reshape(1300, 1900)
+    
+    # Create 100x100 subgraphs (13x19 grid)
+    subgraphs = create_subgraphs(X_grid, y_grid, subgraph_size=100)
+        
     
     # Train the model
     print("\nTraining model...")
-    model = train_model(data, epochs=50, lr=0.005)
+    model = train_on_subgraphs(subgraphs, epochs=50, lr=0.005)
     
