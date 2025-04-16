@@ -8,6 +8,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+from matplotlib.backends.backend_pdf import PdfPages
 import rasterio
 from sklearn.feature_extraction.image import extract_patches_2d
 from skimage.util import view_as_blocks
@@ -133,10 +134,26 @@ def raster_to_tiles(day, patch_size):
     """Memory-efficient version using block processing"""
     with rasterio.open(f"fire_inputs_2025_01_{day}.tif") as src:
         # Read all bands with trimming
-        fuel = src.read(1)[:-454, 519:]  # Remove first 9 columns from all rows
-        wind_mag = src.read(2)[:-454, 519:]
-        wind_dir = src.read(3)[:-454, 519:]        
-        damage = src.read(4)[:-454, 519:]
+        fuel = src.read(1)[:-54, 19:]
+        wind_mag = src.read(2)[:-54, 19:]
+        wind_dir = src.read(3)[:-54, 19:]        
+        damage_init = src.read(4)[:-54, 19:]
+
+    next_day = f"{int(day) + 1:02d}"
+    with rasterio.open(f"fire_inputs_2025_01_{next_day}.tif") as src:
+        # Read all bands with trimming   
+        damage_next = src.read(4)[:-54, 19:]
+
+    if patch_size == 1:
+        # Stack features and get binary damage
+        X = np.stack([
+            fuel, 
+            wind_mag, 
+            wind_dir, 
+            (damage_init > 0).astype(np.float32)  # Convert to binary float
+        ], axis=-1).reshape(-1, 4)
+        y = (damage_next > 0).astype(np.uint8).reshape(-1)
+        return X, y
     
     # Calculate number of patches
     n_rows = fuel.shape[0] // patch_size
@@ -144,22 +161,24 @@ def raster_to_tiles(day, patch_size):
     n_patches = n_rows * n_cols
     
     # Pre-allocate arrays
-    X = np.zeros((n_patches, 3), dtype=np.float32)
+    X = np.zeros((n_patches, 4), dtype=np.float32)
     y = np.zeros(n_patches, dtype=np.uint8)
     
     # Process in blocks
-    for i, (fuel_patch, mag_patch, dir_patch, damage_patch) in enumerate(zip(
+    for i, (fuel_patch, mag_patch, dir_patch, damage_init_patch, damage_next_patch) in enumerate(zip(
         view_as_blocks(fuel, (patch_size, patch_size)),
         view_as_blocks(wind_mag, (patch_size, patch_size)),
         view_as_blocks(wind_dir, (patch_size, patch_size)),
-        view_as_blocks(damage, (patch_size, patch_size))
+        view_as_blocks(damage_init, (patch_size, patch_size)),
+        view_as_blocks(damage_next, (patch_size, patch_size))
     )):
         X[i] = [
             fuel_patch.mean(),
             mag_patch.mean(), 
-            dir_patch.mean()
+            dir_patch.mean(),
+            damage_init_patch.mean()
         ]
-        y[i] = (damage_patch.max() > 0)
+        y[i] = (damage_next_patch.max() > 0)
         
         # Free memory every 1000 patches
         if i % 1000 == 0:
@@ -191,7 +210,30 @@ def build_static_adjacency(patch_grid_shape=(1, 1), neighborhood=8):
 
     return csr_matrix(adj)
 
-def create_subgraphs(X_day1, y_day1, subgraph_size=100):
+def save_subgraphs(X_sub, y_sub, subgraph_size, i, j):
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # 1. Vegetation plot
+    veg_plot = ax1.imshow(X_sub[:,:,0], cmap='YlOrRd', vmin=0, vmax=1)
+    ax1.set_title(f"Vegetation\nPosition: {i}-{i+subgraph_size}, {j}-{j+subgraph_size}")
+    fig.colorbar(veg_plot, ax=ax1)
+    
+    # 2. Pre-damage plot (from X_sub's 4th channel)
+    pre_dmg = ax2.imshow(X_sub[:,:,3], cmap='binary', vmin=0, vmax=1)
+    ax2.set_title(f"Pre-Damage\nBurned={X_sub[:,:,3].sum()} pixels")
+    fig.colorbar(pre_dmg, ax=ax2)
+    
+    # 3. Post-damage plot (from y_sub)
+    post_dmg = ax3.imshow(y_sub, cmap='binary', vmin=0, vmax=1)
+    ax3.set_title(f"Post-Damage\nBurned={y_sub.sum()} pixels")
+    fig.colorbar(post_dmg, ax=ax3)
+    
+    plt.tight_layout()
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def create_subgraphs(X_day1, y_day2, subgraph_size, overlap, min_damage_patches=1):
     """Split the large graph into smaller subgraphs with 50% overlap between adjacent subgraphs."""
     # Create the adjacency matrix for the subgraph (same for every subgraph).
     adj_matrix = build_static_adjacency(
@@ -200,14 +242,16 @@ def create_subgraphs(X_day1, y_day1, subgraph_size=100):
     )
     edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
 
-    # Define stride as half the subgraph size for 50% overlap.
-    stride = subgraph_size // 2
+    # Define stride as half the subgraph size for (1/overlap)% overlap.
+    stride = subgraph_size // overlap
     n_rows, n_cols = X_day1.shape[0], X_day1.shape[1]
     subgraphs = []
 
     # Calculate maximum starting indices to avoid slicing beyond the boundaries.
     max_row_start = n_rows - subgraph_size + 1
     max_col_start = n_cols - subgraph_size + 1
+
+    processed = 0
 
     # Use a sliding window approach with a stride equal to half of subgraph_size.
     for i in range(0, max_row_start, stride):
@@ -217,11 +261,19 @@ def create_subgraphs(X_day1, y_day1, subgraph_size=100):
             y_end = j + subgraph_size
 
             # Extract the 100x100 subsection with the given overlap.
-            X_sub = X_day1[i:x_end, j:y_end]
-            y_sub = y_day1[i:x_end, j:y_end]
+            X_sub = X_day1[i:x_end, j:y_end, :]
+            y_sub = y_day2[i:x_end, j:y_end]
+
+            # Skip if no damage in this subgraph
+            if X_sub[:,:,3].sum() < min_damage_patches:
+                continue
+            
+            processed += 1
+            print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
+            if processed < 1000: save_subgraphs(X_sub, y_sub, subgraph_size, i, j) # Save the subgraph visualization to PDF
 
             # Flatten features and labels.
-            X_flat = X_sub.reshape(-1, 3)  # 3 features per node.
+            X_flat = X_sub.reshape(-1, 4)  # 4 features per node.
             y_flat = y_sub.reshape(-1)
 
             subgraphs.append(Data(
@@ -229,13 +281,15 @@ def create_subgraphs(X_day1, y_day1, subgraph_size=100):
                 edge_index=edge_index,
                 y=torch.FloatTensor(y_flat)
             ))
-
+            gc.collect() # Free memory after each subgraph
+    
+    print(f"Created {len(subgraphs)} subgraphs of size {subgraph_size}x{subgraph_size} with 50% overlap.")
     return subgraphs
 
 
 # Modified training function
-def train_on_subgraphs(subgraphs, epochs=5, lr=0.005):
-    train_data, test_data = train_test_split(subgraphs, test_size=0.2, random_state=42)
+def train_on_subgraphs(subgraphs, epochs=5, lr=0.001):
+    train_data, test_data = train_test_split(subgraphs, test_size=0.4, random_state=42)
     # Create DataLoader
     train_loader = DataLoader(train_data, batch_size=1, shuffle=True)
     test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
@@ -264,7 +318,6 @@ def train_on_subgraphs(subgraphs, epochs=5, lr=0.005):
         if loss.item() < 0.0005:
             print(f"Early stopping at epoch {epoch+1} with loss {loss:.6f}")
             break
-            # Free memory every 1000 batches   
     
     # Evaluation
     model.eval()
@@ -404,16 +457,29 @@ if __name__ == "__main__":
     ##### Y should be fire on day 2, X should include fire on day 1
     ##### get rid of subgraphs with zero damage
 
-    # Process full dataset
-    X_day1, y_day1 = raster_to_tiles("08", patch_size=10)
+    # Process full dataset: 13454 x 19519
+    X_day1, y_day2 = raster_to_tiles("09", patch_size=1)
     
     # Reshape to 2D grid (1300x1900 nodes)
-    X_grid = X_day1.reshape(1300, 1900, 3)
-    y_grid = y_day1.reshape(1300, 1900)
-    
-    # Create 100x100 subgraphs (13x19 grid)
-    subgraphs = create_subgraphs(X_grid, y_grid, subgraph_size=100)
-        
+    X_grid = X_day1.reshape(13400, 19500, 4)
+    y_grid = y_day2.reshape(13400, 19500)
+
+    # plt.figure(figsize=(12, 8))
+    # plt.imshow(X_grid[:, :, 3], cmap='binary', vmin=0, vmax=1)
+    # plt.title(f"Processed Fire Damage (Day 09)")
+    # plt.colorbar(label='Damage (1=burned)')
+    # plt.savefig(f"damage_verification_09.png", dpi=300)
+    # plt.show()
+
+    # plt.figure(figsize=(12, 8))
+    # plt.imshow(y_grid, cmap='binary', vmin=0, vmax=1)
+    # plt.title(f"Processed Fire Damage (Day 10)")
+    # plt.colorbar(label='Damage (1=burned)')
+    # plt.savefig(f"damage_verification_10.png", dpi=300)
+    # plt.show()
+
+    with PdfPages('subgraphs.pdf') as pdf:
+        subgraphs = create_subgraphs(X_grid, y_grid, subgraph_size=1000, overlap=10)
     
     # Train the model
     print("\nTraining model...")
