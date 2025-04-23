@@ -233,8 +233,7 @@ def save_subgraphs(X_sub, y_sub, subgraph_size, i, j):
     plt.close(fig)
 
 
-def create_subgraphs(X_day1, y_day2, subgraph_size, overlap, min_damage_patches=1):
-    """Split the large graph into smaller subgraphs with 50% overlap between adjacent subgraphs."""
+def create_subgraphs(X_day1, y_day2, subgraph_size, stride, save=False, min_damage_patches=1):
     # Create the adjacency matrix for the subgraph (same for every subgraph).
     adj_matrix = build_static_adjacency(
         patch_grid_shape=(subgraph_size, subgraph_size),
@@ -243,7 +242,6 @@ def create_subgraphs(X_day1, y_day2, subgraph_size, overlap, min_damage_patches=
     edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
 
     # Define stride as half the subgraph size for (1/overlap)% overlap.
-    stride = subgraph_size // overlap
     n_rows, n_cols = X_day1.shape[0], X_day1.shape[1]
     subgraphs = []
 
@@ -269,8 +267,8 @@ def create_subgraphs(X_day1, y_day2, subgraph_size, overlap, min_damage_patches=
                 continue
             
             processed += 1
-            print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
-            if processed < 1000: save_subgraphs(X_sub, y_sub, subgraph_size, i, j) # Save the subgraph visualization to PDF
+            # print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
+            if save and processed < 1000: save_subgraphs(X_sub, y_sub, subgraph_size, i, j) # Save the subgraph visualization to PDF
 
             # Flatten features and labels.
             X_flat = X_sub.reshape(-1, 4)  # 4 features per node.
@@ -281,67 +279,111 @@ def create_subgraphs(X_day1, y_day2, subgraph_size, overlap, min_damage_patches=
                 edge_index=edge_index,
                 y=torch.FloatTensor(y_flat)
             ))
-            gc.collect() # Free memory after each subgraph
-    
-    print(f"Created {len(subgraphs)} subgraphs of size {subgraph_size}x{subgraph_size} with 50% overlap.")
+            
+        gc.collect() # Free memory after each subgraph
+
+    print(f"Created {len(subgraphs)} subgraphs of size {subgraph_size}x{subgraph_size} with {subgraph_size/stride}% overlap.")
     return subgraphs
 
+def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    device='cpu'
+    print(f"Using device: {device}")
 
-# Modified training function
-def train_on_subgraphs(subgraphs, epochs=5, lr=0.001):
+    # Split data (moved to GPU later)
+    subgraphs = [graph.to(device) for graph in subgraphs]
     train_data, test_data = train_test_split(subgraphs, test_size=0.4, random_state=42)
-    # Create DataLoader
-    train_loader = DataLoader(train_data, batch_size=1, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
     
-    # Initialize model (using first subgraph's dimensions)
-    num_features = subgraphs[0].x.shape[1]
-    model = FireSpreadGAT(num_features=num_features, hidden_channels=32, num_heads=4)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Initialize model
+    num_features = train_data[0].x.shape[1]
+    model = FireSpreadGAT(
+        num_features=num_features,
+        hidden_channels=64,  # Increased capacity
+        num_heads=4,
+        dropout=0.3  # Added regularization
+    ).to(device)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.BCELoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2)
+    
+    # Convert data to GPU batches
+    def to_dev(batch):
+        print(f"x: {batch.x.device}, edge_index: {batch.edge_index.device}, y: {batch.y.device}")
+        return batch.to(device)
+    
+    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, collate_fn=to_dev)
+    test_loader = DataLoader(test_data, batch_size=64, shuffle=False, collate_fn=to_dev)
+
+    # Training loop
+    best_loss = float('inf')
+    patience_counter = 0
     
     for epoch in range(epochs):
         model.train()
+        epoch_loss = 0
         
         for data in train_loader:
-            y = np.squeeze(data.y)
-            optimizer.zero_grad()
-            out = np.squeeze(model(data))
-            loss = criterion(out, y)
+            data.x = data.x.to(device)
+            data.y = data.y.to(device)
+            optimizer.zero_grad(set_to_none=True)  # More memory efficient
+            
+            # Forward pass with mixed precision
+            out = model(data).squeeze()
+            loss = criterion(out, data.y.squeeze())
+            
+            # Backward pass
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
             optimizer.step()
+            
+            epoch_loss += loss.item()
         
-        if (epoch + 1) % 1 == 0:
-            print(f'Epoch {epoch+1}/{epochs}, Loss: {loss.item():.6f}')
-            gc.collect()
+        # Validation
+        model.eval()
+        val_loss = 0
+        y_true, y_pred = [], []
+        
+        with torch.no_grad():
+            for data in test_loader:
+                out = model(data).squeeze()
+                val_loss += criterion(out, data.y.squeeze()).item()
+                y_true.extend(data.y.cpu().tolist())
+                y_pred.extend((out > 0.5).float().cpu().tolist())
+        
+        # Metrics
+        avg_loss = epoch_loss / len(train_loader)
+        avg_val_loss = val_loss / len(test_loader)
+        scheduler.step(avg_val_loss)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred)
+        
+        print(f'Epoch {epoch+1:03d} | '
+              f'Train Loss: {avg_loss:.6f} | '
+              f'Val Loss: {avg_val_loss:.6f} | '
+              f'Acc: {accuracy:.4f} | '
+              f'F1: {f1:.4f}')
+        
+        # Early stopping
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), 'best_model.pt')
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+        
+        # Memory cleanup
+        gc.collect()
 
-        if loss.item() < 0.0005:
-            print(f"Early stopping at epoch {epoch+1} with loss {loss:.6f}")
-            break
-    
-    # Evaluation
-    model.eval()
-    y_true, y_pred = [], []
-    
-    with torch.no_grad():
-        for data in test_loader:
-            pred = model(data)
-            y_true.extend(data.y.view(-1).tolist())
-            y_pred.extend((pred > 0.5).float().view(-1).tolist())
-    
-    # Calculate metrics
-    accuracy = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred)
-    recall = recall_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
-    
-    print(f'\nTest Metrics:')
-    print(f'Accuracy: {accuracy:.4f}')
-    print(f'Precision: {precision:.4f}')
-    print(f'Recall: {recall:.4f}')
-    print(f'F1 Score: {f1:.4f}')
-    
-    return model
+    # Load best model
+    model.load_state_dict(torch.load('best_model.pt'))
+    return model.to('cpu')  # Return to CPU for inference
+
     
 # 2. GAT Model Architecture
 class FireSpreadGAT(nn.Module):
@@ -427,35 +469,6 @@ def train_model(data_list, epochs=100, lr=0.01):
 
 # Main execution
 if __name__ == "__main__":
-    # # Create synthetic data (replace with your real data)
-    # print("Creating synthetic data...")
-    # data_list = create_synthetic_data(num_nodes=100, num_days=3)
-    # model = train_model(data, epochs=50, lr=0.005)
-    # # Example prediction on new data
-    # print("\nMaking a prediction on new data...")
-    # new_data = create_synthetic_data(num_nodes=100, num_days=1)[0]  # Single day
-    # model.eval()
-    # with torch.no_grad():
-    #     prediction = model(new_data)
-    
-    # print(f"Predicted fire spread for {prediction.shape[0]} areas:")
-    # print(f"Number of areas predicted to catch fire: {(prediction > 0.5).sum().item()}")
-
-    # # Example for 2 consecutive days
-    # X_day1, y_day1 = raster_to_tiles("08", patch_size=10)
-    # # X_day2, y_day2 = raster_to_graph("09")
-
-    # adj_matrix = build_static_adjacency(patch_grid_shape=(X_day1.shape[0], X_day1.shape[1]), neighborhood=8)
-    # edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
-
-    # data = Data(
-    #     x=torch.tensor(X_day1, dtype=torch.float),
-    #     edge_index=edge_index,
-    #     y=torch.tensor(y_day1, dtype=torch.float)
-    # )
-
-    ##### Y should be fire on day 2, X should include fire on day 1
-    ##### get rid of subgraphs with zero damage
 
     # Process full dataset: 13454 x 19519
     X_day1, y_day2 = raster_to_tiles("09", patch_size=1)
@@ -479,7 +492,7 @@ if __name__ == "__main__":
     # plt.show()
 
     with PdfPages('subgraphs.pdf') as pdf:
-        subgraphs = create_subgraphs(X_grid, y_grid, subgraph_size=1000, overlap=10)
+        subgraphs = create_subgraphs(X_grid, y_grid, subgraph_size=100, stride=50, min_damage_patches=10)
     
     # Train the model
     print("\nTraining model...")
