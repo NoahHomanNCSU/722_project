@@ -60,15 +60,15 @@ model = PINN_Bayesian(layer_dims_list=layer_dims_list, activation_function='tanh
 day = "09"
 data_dir = "722_project/"
 with rasterio.open(f"{data_dir}fire_inputs_2025_01_{day}.tif") as src:
-    fuel = src.read(1)[:500, -500:]
-    wx = src.read(2)[:500, -500:]  # wind_x
-    wy = src.read(3)[:500, -500:]  # wind_y
-    damage = src.read(4)[0:5000, :]
+    fuel = src.read(1)[:-54, 19:]
+    wx = src.read(2)[:-54, 19:]
+    wy = src.read(3)[:-54, 19:]        
+    damage = src.read(4)[:-54, 19:]
 
-    plt.imshow(damage, cmap='binary_r', interpolation='none')
-    plt.grid(which='both', color='red', linestyle=':', linewidth=0.5)
-    plt.gca().set_xticks(range(0, 500, 50))
-    plt.gca().set_yticks(range(0, 500, 50))
+    # plt.imshow(damage, cmap='binary_r', interpolation='none')
+    # plt.grid(which='both', color='red', linestyle=':', linewidth=0.5)
+    # plt.gca().set_xticks(range(0, 500, 50))
+    # plt.gca().set_yticks(range(0, 500, 50))
 
 # Environment extents and grid
 # Nt = 48

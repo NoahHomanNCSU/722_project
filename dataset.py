@@ -11,6 +11,8 @@ Datasets and dataset utilities
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 __author__      = "Joel Janek Dabrowski"
 __license__     = "MIT license"
@@ -19,6 +21,9 @@ __version__     = "0.0.0"
 def level_set_function(x, y, x0=0.0, y0=0.0, offset=0.0):
     """
     Generate the level set function in the form of a signed distance function.
+    Positive values: Outside the firefront.
+    Negative values: Inside the firefront.
+    Zero values: Firefront boundary.
 
     :param x: grid over the x-dimension with shape [Nx]
     :param y: grid over the y-dimension with shape [Ny]
@@ -35,6 +40,61 @@ def level_set_function(x, y, x0=0.0, y0=0.0, offset=0.0):
         u = torch.zeros((Nx, Ny, 1))
         # Signed distance function
         u[:, :, 0] = torch.sqrt((X-x0)**2 + (Y-y0)**2) - offset
+    return u
+
+def level_set_palisades(X):
+    """
+    Generate the level set function given the Palisades fire damage data.
+    Positive values: Outside the firefront.
+    Negative values: Inside the firefront.
+    Zero values: Firefront boundary.
+
+    :param X: raster grid over the x-dimension with shape [height, width]
+    :return: the level set function with shape [height, width, 1]
+    """
+    with torch.no_grad():
+        # Initialize level set (1 for unburned, -1 for burned)
+        X = torch.from_numpy(X).float().clone()
+        u = torch.where(X > 0, -1.0, 1.0)
+        
+        # Create a kernel for checking 8-neighborhood connectivity
+        kernel = torch.ones(3, 3, device=X.device)
+        kernel[1,1] = 0  # Ignore center pixel
+        
+        # Pad the input to handle edge pixels
+        padded = F.pad(u.unsqueeze(0).unsqueeze(0), (1,1,1,1), mode='constant', value=1)
+        
+        # Convolve to count neighboring unburned pixels (value=1)
+        neighbor_count = F.conv2d(padded, kernel.unsqueeze(0).unsqueeze(0))
+        
+        # Find boundary pixels:
+        # 1) Current pixel is burned (-1)
+        # 2) Has at least one unburned neighbor (neighbor_count > 0)
+        boundary_mask = (u == -1) & (neighbor_count.squeeze() > 0)
+        
+        # Set boundary pixels to 0
+        u[boundary_mask] = 0.0
+        
+        # Add channel dimension
+        u = u.unsqueeze(-1)
+
+    # Convert to numpy if it's a torch tensor
+    level_set = u.squeeze().numpy()
+
+    plt.figure(figsize=(8, 6))
+
+    # Create binary mask where boundary=0 becomes black (0), everything else white (1)
+    boundary_only = np.where(level_set == 0, 0, 1)
+
+    # Display with grayscale colormap (0=black, 1=white)
+    plt.imshow(boundary_only, cmap='gray', vmin=0, vmax=1)
+
+    plt.title("Fire Boundary Outline")
+    plt.axis('off')
+
+    # Remove colorbar since we're using binary values
+    plt.show()
+
     return u
 
 def c_wind_obstruction_complex(t, x, y):
