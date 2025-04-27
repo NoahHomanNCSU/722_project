@@ -469,15 +469,18 @@ def train_model(data_list, epochs=100, lr=0.01):
 
 def visualize_predictions(subgraph_size):
     X_day09, y_day10 = raster_to_tiles("09", patch_size=1)
+    X_day09 = X_day09.reshape(13400, 19500, 4)
+    y_day10 = y_day10.reshape(13400, 19500)
+
     # subgraphs = create_subgraphs(X_day1=X_day09, y_day2=y_day10, subgraph_size=100, stride=100, min_damage_patches=0)
 
     model = FireSpreadGAT(
-        num_features=X_day09.shape[1],
+        num_features=X_day09.shape[2],
         hidden_channels=64,  # Increased capacity
         num_heads=4,
         dropout=0.3  # Added regularization
     ).to("cpu")
-    model.load_state_dict(torch.load('best_model.pt'))
+    model.load_state_dict(torch.load(f'{data_dir}data/best_model.pt'))
     model.eval()
 
     # Create the adjacency matrix for the subgraph (same for every subgraph).
@@ -505,16 +508,13 @@ def visualize_predictions(subgraph_size):
 
             # Extract the 100x100 subsection with the given overlap.
             X_sub = X_day09[i:x_end, j:y_end, :]
-            y_sub = y_day2[i:x_end, j:y_end]
             
             # Flatten features and labels.
             X_flat = X_sub.reshape(-1, 4)  # 4 features per node.
-            y_flat = y_sub.reshape(-1)
 
             subgraph = Data(
                 x=torch.FloatTensor(X_flat),
-                edge_index=edge_index,
-                y=torch.FloatTensor(y_flat)
+                edge_index=edge_index
             )
             processed += 1
 
@@ -524,7 +524,7 @@ def visualize_predictions(subgraph_size):
             # Store predictions
             full_pred[i:x_end, j:y_end] = pred.cpu().numpy().reshape(100, 100)
 
-            print(f"Processed subgraph {i+1}/{len(subgraphs)}: {i}-{x_end}, {j}-{y_end}")
+            print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
 
         gc.collect() # Free memory after each subgraph
     
@@ -549,10 +549,10 @@ def visualize_predictions(subgraph_size):
     # - Red = True Positive (predicted 1, truth 1)
     # - Blue = False Positive (predicted 1, truth 0)
     # - Green = False Negative (predicted 0, truth 1)
-    comparison = np.zeros((*full_truth.shape, 3))
+    comparison = np.zeros((*y_day10.shape, 3))
     comparison[..., 0] = (full_pred & full_truth)  # Red channel - True positives
-    comparison[..., 1] = (~full_pred.astype(bool) & full_truth)  # Green channel - False negatives
-    comparison[..., 2] = (full_pred.astype(bool) & ~full_truth)  # Blue channel - False positives
+    comparison[..., 1] = (~full_pred.astype(bool) & y_day10)  # Green channel - False negatives
+    comparison[..., 2] = (full_pred.astype(bool) & ~y_day10)  # Blue channel - False positives
     
     plt.imshow(comparison)
     plt.title('Comparison (TP=Red, FN=Green, FP=Blue)')

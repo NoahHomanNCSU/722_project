@@ -26,7 +26,7 @@ from matplotlib.patches import Rectangle
 from tqdm import tqdm
 import time
 
-from dataset import DatasetScaler, level_set_function, c_wind_obstruction_complex
+from dataset import DatasetScaler, level_set_function, level_set_palisades, c_wind_obstruction_complex
 from pinn import PINN_Bayesian
 
 from scipy.ndimage import distance_transform_edt
@@ -108,29 +108,8 @@ with torch.no_grad():
     x0 = x_norm(x0)
     y0 = y_norm(y0)
     t0 = t_norm(t0)
-    # u0 = level_set_function(x0[:,0,0], y0[0,:,0], x_mid, y_mid, offset)
-    # s0, wx0, wy0 = c_wind_obstruction_complex(t0[0,0,:], x0[:,0,0], y0[0,:,0])
-    
-    damage = torch.tensor(damage, dtype=torch.float32)
-    damage_np = damage.numpy()
-    dist_out = distance_transform_edt(1 - damage_np)  # Distance from unburned->boundary
-    # Distance to fire boundary (negative inside burned areas)
-    dist_in = -distance_transform_edt(damage_np)  # Distance from burned->boundary
-    # Combine distances
-    sdf_np = np.where(damage_np == 1, dist_in, dist_out)
-    # Convert back to tensor and normalize if needed
-    u0 = torch.tensor(sdf_np, dtype=torch.float32).unsqueeze(-1)  # Shape [H, W, 1]
-    u0 = torch.where(damage == 1, -1.0, 1.0)
-    plt.imshow(u0, cmap='binary_r', interpolation='none')
-    plt.grid(which='both', color='red', linestyle=':', linewidth=0.5)
-    plt.gca().set_xticks(range(0, 500, 50))
-    plt.gca().set_yticks(range(0, 500, 50))
-
-    plt.imshow(u0.squeeze().cpu().numpy(), cmap='coolwarm', origin='lower')
-    plt.colorbar()
-    plt.title("Signed Distance Function (SDF)")
-    plt.show()
-        
+    u0 = level_set_palisades(damage)
+    # s0, wx0, wy0 = c_wind_obstruction_complex(t0[0,0,:], x0[:,0,0], y0[0,:,0])        
     s0 = torch.tensor(fuel).unsqueeze(-1)
     wx0 = torch.tensor(wx).unsqueeze(-1)
     wy0 = torch.tensor(wy).unsqueeze(-1)
