@@ -14,6 +14,8 @@ __version__     = "0.0.0"
 
 
 import numpy as np
+import rasterio
+from shapely import transform
 import torch
 
 torch.manual_seed(0)
@@ -26,6 +28,8 @@ import time
 
 from dataset import DatasetScaler, level_set_function, c_wind_obstruction_complex
 from pinn import PINN_Bayesian
+
+from scipy.ndimage import distance_transform_edt
     
 train_model = True
 n_epochs = 16000
@@ -33,21 +37,6 @@ learning_rate = 1e-3
 predictive_cost = True
 save_file = 'model_parameters/bpinn.pt'
 
-# Environment extents and grid
-Nt = 48
-Nx = 35
-Ny = 35
-x_min = 0.0
-x_max = 1.0
-y_min = 0.0
-y_max = 1.0
-t_min = 0.0
-t_max = 0.1
-x_mid = 0.5
-y_mid = 0.5
-t0 = 0.0
-offset = 0.15
-dt = (t_max - t_min) / (Nt-1)
 
 # ---------------------------------------------------------------------------- #
 # Create the PINN
@@ -67,6 +56,40 @@ sigma2_s = 1 / (2 * np.pi * 10.)
 model = PINN_Bayesian(layer_dims_list=layer_dims_list, activation_function='tanh', save_file=save_file)
 
 # ---------------------------------------------------------------------------- #
+# Reading in Palisades fire data
+day = "09"
+data_dir = "722_project/"
+with rasterio.open(f"{data_dir}fire_inputs_2025_01_{day}.tif") as src:
+    fuel = src.read(1)[:500, -500:]
+    wx = src.read(2)[:500, -500:]  # wind_x
+    wy = src.read(3)[:500, -500:]  # wind_y
+    damage = src.read(4)[0:5000, :]
+
+    plt.imshow(damage, cmap='binary_r', interpolation='none')
+    plt.grid(which='both', color='red', linestyle=':', linewidth=0.5)
+    plt.gca().set_xticks(range(0, 500, 50))
+    plt.gca().set_yticks(range(0, 500, 50))
+
+# Environment extents and grid
+# Nt = 48
+# Nx = 35
+# Ny = 35
+
+Nt = 3
+Nx, Ny = fuel.shape
+print(f"Native resolution: {Nx} columns x {Ny} rows")
+
+x_min = 0.0
+x_max = 100
+y_min = 0.0
+y_max = 100
+t_min = 0.0
+t_max = 0.1
+x_mid = x_min + (x_max - x_min) / 2
+y_mid = y_min + (y_max - y_min) / 2
+offset = 0.15
+dt = (t_max - t_min) / (Nt-1)
+
 # Dataset scalers
 x_norm = DatasetScaler(x_min, x_max)
 y_norm = DatasetScaler(y_min, y_max)
@@ -78,15 +101,40 @@ with torch.no_grad():
     # Initial condition
     x0 = torch.linspace(x_min, x_max, Nx)
     y0 = torch.linspace(y_min, y_max, Ny)
-    y0 = torch.linspace(y_min, y_max, Ny)
     t0 = torch.linspace(t_min, t_min, 1)
     x0, y0, t0 = torch.meshgrid(x0, y0, t0)
+
     # Scale
     x0 = x_norm(x0)
     y0 = y_norm(y0)
     t0 = t_norm(t0)
-    u0 = level_set_function(x0[:,0,0], y0[0,:,0], x_mid, y_mid, offset)
-    s0, wx0, wy0 = c_wind_obstruction_complex(t0[0,0,:], x0[:,0,0], y0[0,:,0])
+    # u0 = level_set_function(x0[:,0,0], y0[0,:,0], x_mid, y_mid, offset)
+    # s0, wx0, wy0 = c_wind_obstruction_complex(t0[0,0,:], x0[:,0,0], y0[0,:,0])
+    
+    damage = torch.tensor(damage, dtype=torch.float32)
+    damage_np = damage.numpy()
+    dist_out = distance_transform_edt(1 - damage_np)  # Distance from unburned->boundary
+    # Distance to fire boundary (negative inside burned areas)
+    dist_in = -distance_transform_edt(damage_np)  # Distance from burned->boundary
+    # Combine distances
+    sdf_np = np.where(damage_np == 1, dist_in, dist_out)
+    # Convert back to tensor and normalize if needed
+    u0 = torch.tensor(sdf_np, dtype=torch.float32).unsqueeze(-1)  # Shape [H, W, 1]
+    u0 = torch.where(damage == 1, -1.0, 1.0)
+    plt.imshow(u0, cmap='binary_r', interpolation='none')
+    plt.grid(which='both', color='red', linestyle=':', linewidth=0.5)
+    plt.gca().set_xticks(range(0, 500, 50))
+    plt.gca().set_yticks(range(0, 500, 50))
+
+    plt.imshow(u0.squeeze().cpu().numpy(), cmap='coolwarm', origin='lower')
+    plt.colorbar()
+    plt.title("Signed Distance Function (SDF)")
+    plt.show()
+        
+    s0 = torch.tensor(fuel).unsqueeze(-1)
+    wx0 = torch.tensor(wx).unsqueeze(-1)
+    wy0 = torch.tensor(wy).unsqueeze(-1)
+
     # Reshape
     x0 = x0.reshape(-1,1)
     y0 = y0.reshape(-1,1)

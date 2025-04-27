@@ -132,7 +132,7 @@ def visualize_fire_data(data, day, grid_size=10):
 
 def raster_to_tiles(day, patch_size):
     """Memory-efficient version using block processing"""
-    with rasterio.open(f"fire_inputs_2025_01_{day}.tif") as src:
+    with rasterio.open(f"{data_dir}fire_inputs_2025_01_{day}.tif") as src:
         # Read all bands with trimming
         fuel = src.read(1)[:-54, 19:]
         wind_mag = src.read(2)[:-54, 19:]
@@ -140,7 +140,7 @@ def raster_to_tiles(day, patch_size):
         damage_init = src.read(4)[:-54, 19:]
 
     next_day = f"{int(day) + 1:02d}"
-    with rasterio.open(f"fire_inputs_2025_01_{next_day}.tif") as src:
+    with rasterio.open(f"{data_dir}fire_inputs_2025_01_{next_day}.tif") as src:
         # Read all bands with trimming   
         damage_next = src.read(4)[:-54, 19:]
 
@@ -287,7 +287,7 @@ def create_subgraphs(X_day1, y_day2, subgraph_size, stride, save=False, min_dama
 
 def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    device='cpu'
+    # device='cpu'
     print(f"Using device: {device}")
 
     # Split data (moved to GPU later)
@@ -467,8 +467,107 @@ def train_model(data_list, epochs=100, lr=0.01):
     
     return model
 
+def visualize_predictions(subgraph_size):
+    X_day09, y_day10 = raster_to_tiles("09", patch_size=1)
+    # subgraphs = create_subgraphs(X_day1=X_day09, y_day2=y_day10, subgraph_size=100, stride=100, min_damage_patches=0)
+
+    model = FireSpreadGAT(
+        num_features=X_day09.shape[1],
+        hidden_channels=64,  # Increased capacity
+        num_heads=4,
+        dropout=0.3  # Added regularization
+    ).to("cpu")
+    model.load_state_dict(torch.load('best_model.pt'))
+    model.eval()
+
+    # Create the adjacency matrix for the subgraph (same for every subgraph).
+    adj_matrix = build_static_adjacency(
+        patch_grid_shape=(subgraph_size, subgraph_size),
+        neighborhood=8
+    )
+    edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
+
+    # Define stride as half the subgraph size for (1/overlap)% overlap.
+    n_rows, n_cols = X_day09.shape[0], X_day09.shape[1]
+
+    # Calculate maximum starting indices to avoid slicing beyond the boundaries.
+    max_row_start = n_rows - subgraph_size + 1
+    max_col_start = n_cols - subgraph_size + 1
+
+    processed = 0
+    full_pred = np.zeros_like(y_day10)
+    # Use a sliding window approach
+    for i in range(0, max_row_start, subgraph_size):
+        for j in range(0, max_col_start, subgraph_size):
+            # Define the subgraph boundaries.
+            x_end = i + subgraph_size
+            y_end = j + subgraph_size
+
+            # Extract the 100x100 subsection with the given overlap.
+            X_sub = X_day09[i:x_end, j:y_end, :]
+            y_sub = y_day2[i:x_end, j:y_end]
+            
+            # Flatten features and labels.
+            X_flat = X_sub.reshape(-1, 4)  # 4 features per node.
+            y_flat = y_sub.reshape(-1)
+
+            subgraph = Data(
+                x=torch.FloatTensor(X_flat),
+                edge_index=edge_index,
+                y=torch.FloatTensor(y_flat)
+            )
+            processed += 1
+
+            out = model(subgraph).squeeze()
+            pred = (out > 0.5).float()  # Convert to binary predictions
+            
+            # Store predictions
+            full_pred[i:x_end, j:y_end] = pred.cpu().numpy().reshape(100, 100)
+
+            print(f"Processed subgraph {i+1}/{len(subgraphs)}: {i}-{x_end}, {j}-{y_end}")
+
+        gc.collect() # Free memory after each subgraph
+    
+    # Create visualization
+    plt.figure(figsize=(15, 5))
+    
+    # Ground truth
+    plt.subplot(1, 3, 1)
+    plt.imshow(y_day10, cmap='Reds')
+    plt.title('Ground Truth')
+    plt.colorbar()
+    
+    # Predictions
+    plt.subplot(1, 3, 2)
+    plt.imshow(full_pred, cmap='Reds')
+    plt.title('Model Predictions')
+    plt.colorbar()
+    
+    # Overlay comparison
+    plt.subplot(1, 3, 3)
+    # Create RGB image where:
+    # - Red = True Positive (predicted 1, truth 1)
+    # - Blue = False Positive (predicted 1, truth 0)
+    # - Green = False Negative (predicted 0, truth 1)
+    comparison = np.zeros((*full_truth.shape, 3))
+    comparison[..., 0] = (full_pred & full_truth)  # Red channel - True positives
+    comparison[..., 1] = (~full_pred.astype(bool) & full_truth)  # Green channel - False negatives
+    comparison[..., 2] = (full_pred.astype(bool) & ~full_truth)  # Blue channel - False positives
+    
+    plt.imshow(comparison)
+    plt.title('Comparison (TP=Red, FN=Green, FP=Blue)')
+    
+    plt.tight_layout()
+    plt.show()
+
+# Directory storing stacked fire inputs
+data_dir = "722_project/"
+
 # Main execution
 if __name__ == "__main__":
+
+    visualize_predictions(subgraph_size=100)
+    quit(0)
 
     # Process full dataset: 13454 x 19519
     X_day1, y_day2 = raster_to_tiles("09", patch_size=1)
