@@ -17,6 +17,10 @@ import gc
 import psutil
 import time
 
+
+# Directory storing stacked fire inputs
+DATA_DIR = "722_project/"
+
 # Set random seeds for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
@@ -156,7 +160,7 @@ def save_subgraphs(X_sub, y_sub, subgraph_size, i, j):
 
 def raster_to_tiles(day, patch_size):
     """Memory-efficient version using block processing"""
-    with rasterio.open(f"{data_dir}fire_inputs_2025_01_{day}.tif") as src:
+    with rasterio.open(f"{DATA_DIR}fire_inputs_2025_01_{day}.tif") as src:
         # Read all bands with trimming
         fuel = src.read(1)[:-54, 19:]
         wind_x = src.read(2)[:-54, 19:]
@@ -164,7 +168,7 @@ def raster_to_tiles(day, patch_size):
         damage_init = src.read(4)[:-54, 19:]
 
     next_day = f"{int(day) + 1:02d}"
-    with rasterio.open(f"{data_dir}fire_inputs_2025_01_{next_day}.tif") as src:
+    with rasterio.open(f"{DATA_DIR}fire_inputs_2025_01_{next_day}.tif") as src:
         # Read all bands with trimming   
         damage_next = src.read(4)[:-54, 19:]
 
@@ -440,7 +444,7 @@ def visualize_predictions(subgraph_size, day, best_model):
         num_heads=4,
         dropout=0.3  # Added regularization
     ).to("cpu")
-    model.load_state_dict(torch.load(f'{data_dir}{best_model}'))
+    model.load_state_dict(torch.load(f'{DATA_DIR}{best_model}'))
     model.eval()
 
     # Create the adjacency matrix for the subgraph (same for every subgraph).
@@ -523,16 +527,8 @@ def visualize_predictions(subgraph_size, day, best_model):
     plt.tight_layout()
     plt.show()
 
-# Directory storing stacked fire inputs
-data_dir = "722_project/"
-
 # Main execution
 if __name__ == "__main__":
-
-    # Visualize predictions made by best model
-    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200.pt')
-    # visualize_predictions(subgraph_size=100, day="09", best_model='best_model_200.pt')
-    # quit(0)
 
     # Train the model
     print("\nTraining model: day 08 -> 09, subgraph size 100")
@@ -541,6 +537,14 @@ if __name__ == "__main__":
     # print("\nTraining model: day 09 -> 10, subgraph size 100")
     # train_on_subgraphs(day="09", subgraph_size=100, stride=50)
 
-    # print("\nTraining model: day 09 -> 10, subgraph size 200")
+    # print("\nTraining model: day 08 -> 9, subgraph size 200")
     # train_on_subgraphs(day="08", subgraph_size=200, stride=50)
+
+    # print("\nTraining model: day 9 -> 10, subgraph size 200")
     # train_on_subgraphs(day="09", subgraph_size=200, stride=50)
+
+    # Visualize predictions made by best model
+    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_100_08.pt')
+    # visualize_predictions(subgraph_size=100, day="09", best_model='best_model_100_09.pt')
+    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200_08.pt')
+    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200_08.pt')
