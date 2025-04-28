@@ -521,10 +521,17 @@ def visualize_predictions(subgraph_size, day, best_model):
     # - Red = True Positive (predicted 1, truth 1)
     # - Blue = False Positive (predicted 1, truth 0)
     # - Green = False Negative (predicted 0, truth 1)
+<<<<<<< Updated upstream
     comparison = np.zeros((*y_day2.shape, 3))
     comparison[..., 0] = np.logical_and(full_pred, y_day2).astype(np.float32)  # Red channel - True positives
     comparison[..., 1] = (~full_pred.astype(bool) & y_day2.astype(bool))  # Green channel - False negatives
     comparison[..., 2] = (full_pred.astype(bool) & ~y_day2.astype(bool))  # Blue channel - False positives
+=======
+    comparison = np.zeros((*y_day10.shape, 3))
+    comparison[..., 0] = (full_pred & y_day10)  # Red channel - True positives
+    comparison[..., 1] = (~full_pred.astype(bool) & y_day10)  # Green channel - False negatives
+    comparison[..., 2] = (full_pred.astype(bool) & ~y_day10)  # Blue channel - False positives
+>>>>>>> Stashed changes
     
     plt.imshow(comparison)
     plt.title('Comparison (TP=Red, FN=Green, FP=Blue)')
