@@ -131,6 +131,28 @@ def visualize_fire_data(data, day, grid_size=10):
     plt.tight_layout()
     plt.show()
 
+def save_subgraphs(X_sub, y_sub, subgraph_size, i, j):
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # 1. Vegetation plot
+    veg_plot = ax1.imshow(X_sub[:,:,0], cmap='YlOrRd', vmin=0, vmax=1)
+    ax1.set_title(f"Vegetation\nPosition: {i}-{i+subgraph_size}, {j}-{j+subgraph_size}")
+    fig.colorbar(veg_plot, ax=ax1)
+    
+    # 2. Pre-damage plot (from X_sub's 4th channel)
+    pre_dmg = ax2.imshow(X_sub[:,:,3], cmap='binary', vmin=0, vmax=1)
+    ax2.set_title(f"Pre-Damage\nBurned={X_sub[:,:,3].sum()} pixels")
+    fig.colorbar(pre_dmg, ax=ax2)
+    
+    # 3. Post-damage plot (from y_sub)
+    post_dmg = ax3.imshow(y_sub, cmap='binary', vmin=0, vmax=1)
+    ax3.set_title(f"Post-Damage\nBurned={y_sub.sum()} pixels")
+    fig.colorbar(post_dmg, ax=ax3)
+    
+    plt.tight_layout()
+    # pdf.savefig(fig)
+    plt.close(fig)
+
 
 def raster_to_tiles(day, patch_size):
     """Memory-efficient version using block processing"""
@@ -212,32 +234,10 @@ def build_static_adjacency(patch_grid_shape=(1, 1), neighborhood=8):
 
     return csr_matrix(adj)
 
-def save_subgraphs(X_sub, y_sub, subgraph_size, i, j):
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # 1. Vegetation plot
-    veg_plot = ax1.imshow(X_sub[:,:,0], cmap='YlOrRd', vmin=0, vmax=1)
-    ax1.set_title(f"Vegetation\nPosition: {i}-{i+subgraph_size}, {j}-{j+subgraph_size}")
-    fig.colorbar(veg_plot, ax=ax1)
-    
-    # 2. Pre-damage plot (from X_sub's 4th channel)
-    pre_dmg = ax2.imshow(X_sub[:,:,3], cmap='binary', vmin=0, vmax=1)
-    ax2.set_title(f"Pre-Damage\nBurned={X_sub[:,:,3].sum()} pixels")
-    fig.colorbar(pre_dmg, ax=ax2)
-    
-    # 3. Post-damage plot (from y_sub)
-    post_dmg = ax3.imshow(y_sub, cmap='binary', vmin=0, vmax=1)
-    ax3.set_title(f"Post-Damage\nBurned={y_sub.sum()} pixels")
-    fig.colorbar(post_dmg, ax=ax3)
-    
-    plt.tight_layout()
-    # pdf.savefig(fig)
-    plt.close(fig)
 
-
-def create_subgraphs(subgraph_size, stride, min_damage_patches):
-    X_day1, y_day2 = raster_to_tiles("08", patch_size=1)
-    X_day2, y_day3 = raster_to_tiles("09", patch_size=1)
+def create_subgraphs(day, subgraph_size, stride, min_damage_patches):
+    X_day1, y_day2 = raster_to_tiles(day, patch_size=1)
+    # X_day2, y_day3 = raster_to_tiles("09", patch_size=1)
 
     n_rows, n_cols = X_day1.shape[0], X_day1.shape[1]
     subgraphs = []
@@ -247,39 +247,27 @@ def create_subgraphs(subgraph_size, stride, min_damage_patches):
 
     processed = 0
 
-    def create_subgraph(i, x_end, j, y_end, X, Y):
-        X_sub = X[i:x_end, j:y_end, :]
-        y_sub = Y[i:x_end, j:y_end]
-
-        if X_sub[:, :, 3].sum() < min_damage_patches:
-            return None
-        
-        X_flat = torch.from_numpy(X_sub.reshape(-1, 4).astype(np.float32))
-        y_flat = torch.from_numpy(y_sub.reshape(-1).astype(np.float32))
-
-        return Data(
-                x=X_flat,
-                edge_index=None,
-                y=y_flat
-            )
-
-
     for i in range(0, max_row_start, stride):
         for j in range(0, max_col_start, stride):
             x_end = i + subgraph_size
             y_end = j + subgraph_size
 
-            # From day8 -> day9
-            result1 = create_subgraph(i, x_end, j, y_end, X_day1, y_day2)
-            if result1 is not None:
-                subgraphs.append(result1)
-                processed += 1
+            X_sub = X_day1[i:x_end, j:y_end, :]
+            y_sub = y_day2[i:x_end, j:y_end]
 
-            # From day9 -> day10
-            result2 = create_subgraph(i, x_end, j, y_end, X_day2, y_day3)
-            if result2 is not None:
-                subgraphs.append(result2)
-                processed += 1
+            if X_sub[:, :, 3].sum() < min_damage_patches:
+                continue
+            
+            X_flat = torch.from_numpy(X_sub.reshape(-1, 4).astype(np.float32))
+            y_flat = torch.from_numpy(y_sub.reshape(-1).astype(np.float32))
+
+            subgraphs.append(Data(
+                x=X_flat,
+                edge_index=None,
+                y=y_flat
+            ))
+
+            processed += 1
 
             if processed % 100 == 0:
                 print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
@@ -290,9 +278,9 @@ def create_subgraphs(subgraph_size, stride, min_damage_patches):
     return subgraphs
 
 
-def train_on_subgraphs(subgraph_size, stride, min_damage_patches=5, epochs=50, lr=0.005, early_stop_patience=5):
+def train_on_subgraphs(day, subgraph_size, stride, min_damage_patches=5, epochs=50, lr=0.005, early_stop_patience=5):
     # Specify gpu/cpu/mps usage
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'gpu' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # Make some subgraphs + the adjacency matrix
@@ -301,7 +289,7 @@ def train_on_subgraphs(subgraph_size, stride, min_damage_patches=5, epochs=50, l
         neighborhood=8
     )
     edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long).to(device)
-    subgraphs = create_subgraphs(subgraph_size=subgraph_size, stride=stride, min_damage_patches=min_damage_patches)
+    subgraphs = create_subgraphs(day, subgraph_size=subgraph_size, stride=stride, min_damage_patches=min_damage_patches)
     if device.type != "cpu": subgraphs = [graph.to(device) for graph in subgraphs]
 
     # Initialize model
@@ -337,8 +325,8 @@ def train_on_subgraphs(subgraph_size, stride, min_damage_patches=5, epochs=50, l
 
         # === Start timers and memory profiling ===
         start_time = time.time()
-        process = psutil.Process()
-        cpu_mem_before = process.memory_info().rss / (1024 ** 2)  # in MB
+        # process = psutil.Process()
+        # cpu_mem_before = process.memory_info().rss / (1024 ** 2)  # in MB
         
         for data in train_loader:  
             data.edge_index = edge_index
@@ -361,8 +349,8 @@ def train_on_subgraphs(subgraph_size, stride, min_damage_patches=5, epochs=50, l
         # === End timers and memory usage ===
         end_time = time.time()
         epoch_time = end_time - start_time
-        cpu_mem_after = process.memory_info().rss / (1024 ** 2)  # in MB
-        cpu_mem_used = cpu_mem_after - cpu_mem_before
+        # cpu_mem_after = process.memory_info().rss / (1024 ** 2)  # in MB
+        # cpu_mem_used = cpu_mem_after - cpu_mem_before
         
         # Validation
         model.eval()
@@ -393,14 +381,14 @@ def train_on_subgraphs(subgraph_size, stride, min_damage_patches=5, epochs=50, l
               f'Acc: {accuracy:.4f} | '
               f'Recall: {recall:.4f} | '
               f'F1: {f1:.4f} | '
-              f'Time: {epoch_time:.2f}s | '
-              f'CPU ΔMem: {cpu_mem_used:.2f}MB')
+              f'Time: {epoch_time:.2f}s | ')
+            #   f'CPU ΔMem: {cpu_mem_used:.2f}MB')
 
         # Early stopping
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), 'best_model.pt')
+            torch.save(model.state_dict(), f'best_model_{subgraph_size}_{day}.pt')
         else:
             patience_counter += 1
             if patience_counter >= early_stop_patience:
@@ -410,7 +398,7 @@ def train_on_subgraphs(subgraph_size, stride, min_damage_patches=5, epochs=50, l
         gc.collect()
 
     # Load best model
-    model.load_state_dict(torch.load('best_model.pt'))
+    model.load_state_dict(torch.load(f'best_model_{subgraph_size}_{day}.pt'))
     return model.to('cpu')  # Return to CPU for inference
 
     
@@ -472,8 +460,8 @@ def visualize_predictions(subgraph_size, day, best_model):
     processed = 0
     full_pred = np.zeros_like(y_day2)
     # Use a sliding window approach
-    for i in range(0, 200, 200):
-        for j in range(0, 200, 200):
+    for i in range(0, max_row_start, 200):
+        for j in range(0, max_col_start, 200):
             # Define the subgraph boundaries.
             x_end = i + subgraph_size
             y_end = j + subgraph_size
@@ -536,16 +524,23 @@ def visualize_predictions(subgraph_size, day, best_model):
     plt.show()
 
 # Directory storing stacked fire inputs
-data_dir = ""
+data_dir = "722_project/"
 
 # Main execution
 if __name__ == "__main__":
 
     # Visualize predictions made by best model
-    visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200.pt')
-    visualize_predictions(subgraph_size=100, day="09", best_model='best_model_200.pt')
-    quit(0)
+    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200.pt')
+    # visualize_predictions(subgraph_size=100, day="09", best_model='best_model_200.pt')
+    # quit(0)
 
     # Train the model
-    print("\nTraining model...")
-    model = train_on_subgraphs(subgraph_size=200, stride=100)
+    print("\nTraining model: day 08 -> 09, subgraph size 100")
+    train_on_subgraphs(day="08", subgraph_size=100, stride=50)
+
+    # print("\nTraining model: day 09 -> 10, subgraph size 100")
+    # train_on_subgraphs(day="09", subgraph_size=100, stride=50)
+
+    # print("\nTraining model: day 09 -> 10, subgraph size 200")
+    # train_on_subgraphs(day="08", subgraph_size=200, stride=50)
+    # train_on_subgraphs(day="09", subgraph_size=200, stride=50)
