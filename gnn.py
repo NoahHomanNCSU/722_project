@@ -472,8 +472,8 @@ def visualize_predictions(subgraph_size, day, best_model):
     processed = 0
     full_pred = np.zeros_like(y_day2)
     # Use a sliding window approach
-    for i in range(0, max_row_start, subgraph_size):
-        for j in range(0, max_col_start, subgraph_size):
+    for i in range(0, 200, 200):
+        for j in range(0, 200, 200):
             # Define the subgraph boundaries.
             x_end = i + subgraph_size
             y_end = j + subgraph_size
@@ -499,6 +499,9 @@ def visualize_predictions(subgraph_size, day, best_model):
             print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
 
         gc.collect() # Free memory after each subgraph
+
+    np.save(f'pred_{best_model}_{int(day) + 1:02d}.npy', full_pred)
+    print(f"Saved predictions for day {day} + 1")
     
     # Create visualization
     plt.figure(figsize=(15, 5))
@@ -521,17 +524,10 @@ def visualize_predictions(subgraph_size, day, best_model):
     # - Red = True Positive (predicted 1, truth 1)
     # - Blue = False Positive (predicted 1, truth 0)
     # - Green = False Negative (predicted 0, truth 1)
-<<<<<<< Updated upstream
     comparison = np.zeros((*y_day2.shape, 3))
-    comparison[..., 0] = np.logical_and(full_pred, y_day2).astype(np.float32)  # Red channel - True positives
+    comparison[..., 0] = (full_pred.astype(bool) & y_day2.astype(bool))  # Red channel - True positives
     comparison[..., 1] = (~full_pred.astype(bool) & y_day2.astype(bool))  # Green channel - False negatives
     comparison[..., 2] = (full_pred.astype(bool) & ~y_day2.astype(bool))  # Blue channel - False positives
-=======
-    comparison = np.zeros((*y_day10.shape, 3))
-    comparison[..., 0] = (full_pred & y_day10)  # Red channel - True positives
-    comparison[..., 1] = (~full_pred.astype(bool) & y_day10)  # Green channel - False negatives
-    comparison[..., 2] = (full_pred.astype(bool) & ~y_day10)  # Blue channel - False positives
->>>>>>> Stashed changes
     
     plt.imshow(comparison)
     plt.title('Comparison (TP=Red, FN=Green, FP=Blue)')
