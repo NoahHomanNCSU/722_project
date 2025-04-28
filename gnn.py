@@ -14,6 +14,8 @@ from sklearn.feature_extraction.image import extract_patches_2d
 from skimage.util import view_as_blocks
 from scipy.sparse import csr_matrix
 import gc
+import psutil
+import time
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -135,8 +137,8 @@ def raster_to_tiles(day, patch_size):
     with rasterio.open(f"{data_dir}fire_inputs_2025_01_{day}.tif") as src:
         # Read all bands with trimming
         fuel = src.read(1)[:-54, 19:]
-        wind_mag = src.read(2)[:-54, 19:]
-        wind_dir = src.read(3)[:-54, 19:]        
+        wind_x = src.read(2)[:-54, 19:]
+        wind_y = src.read(3)[:-54, 19:]        
         damage_init = src.read(4)[:-54, 19:]
 
     next_day = f"{int(day) + 1:02d}"
@@ -148,11 +150,11 @@ def raster_to_tiles(day, patch_size):
         # Stack features and get binary damage
         X = np.stack([
             fuel, 
-            wind_mag, 
-            wind_dir, 
+            wind_x, 
+            wind_y, 
             (damage_init > 0).astype(np.float32)  # Convert to binary float
-        ], axis=-1).reshape(-1, 4)
-        y = (damage_next > 0).astype(np.uint8).reshape(-1)
+        ], axis=-1)
+        y = (damage_next > 0).astype(np.float32)
         return X, y
     
     # Calculate number of patches
@@ -167,8 +169,8 @@ def raster_to_tiles(day, patch_size):
     # Process in blocks
     for i, (fuel_patch, mag_patch, dir_patch, damage_init_patch, damage_next_patch) in enumerate(zip(
         view_as_blocks(fuel, (patch_size, patch_size)),
-        view_as_blocks(wind_mag, (patch_size, patch_size)),
-        view_as_blocks(wind_dir, (patch_size, patch_size)),
+        view_as_blocks(wind_x, (patch_size, patch_size)),
+        view_as_blocks(wind_y, (patch_size, patch_size)),
         view_as_blocks(damage_init, (patch_size, patch_size)),
         view_as_blocks(damage_next, (patch_size, patch_size))
     )):
@@ -229,73 +231,81 @@ def save_subgraphs(X_sub, y_sub, subgraph_size, i, j):
     fig.colorbar(post_dmg, ax=ax3)
     
     plt.tight_layout()
-    pdf.savefig(fig)
+    # pdf.savefig(fig)
     plt.close(fig)
 
 
-def create_subgraphs(X_day1, y_day2, subgraph_size, stride, save=False, min_damage_patches=1):
-    # Create the adjacency matrix for the subgraph (same for every subgraph).
-    adj_matrix = build_static_adjacency(
-        patch_grid_shape=(subgraph_size, subgraph_size),
-        neighborhood=8
-    )
-    edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
+def create_subgraphs(subgraph_size, stride, min_damage_patches):
+    X_day1, y_day2 = raster_to_tiles("08", patch_size=1)
+    X_day2, y_day3 = raster_to_tiles("09", patch_size=1)
 
-    # Define stride as half the subgraph size for (1/overlap)% overlap.
     n_rows, n_cols = X_day1.shape[0], X_day1.shape[1]
     subgraphs = []
 
-    # Calculate maximum starting indices to avoid slicing beyond the boundaries.
     max_row_start = n_rows - subgraph_size + 1
     max_col_start = n_cols - subgraph_size + 1
 
     processed = 0
 
-    # Use a sliding window approach with a stride equal to half of subgraph_size.
+    def create_subgraph(i, x_end, j, y_end, X, Y):
+        X_sub = X[i:x_end, j:y_end, :]
+        y_sub = Y[i:x_end, j:y_end]
+
+        if X_sub[:, :, 3].sum() < min_damage_patches:
+            return None
+        
+        X_flat = torch.from_numpy(X_sub.reshape(-1, 4).astype(np.float32))
+        y_flat = torch.from_numpy(y_sub.reshape(-1).astype(np.float32))
+
+        return Data(
+                x=X_flat,
+                edge_index=None,
+                y=y_flat
+            )
+
+
     for i in range(0, max_row_start, stride):
         for j in range(0, max_col_start, stride):
-            # Define the subgraph boundaries.
             x_end = i + subgraph_size
             y_end = j + subgraph_size
 
-            # Extract the 100x100 subsection with the given overlap.
-            X_sub = X_day1[i:x_end, j:y_end, :]
-            y_sub = y_day2[i:x_end, j:y_end]
+            # From day8 -> day9
+            result1 = create_subgraph(i, x_end, j, y_end, X_day1, y_day2)
+            if result1 is not None:
+                subgraphs.append(result1)
+                processed += 1
 
-            # Skip if no damage in this subgraph
-            if X_sub[:,:,3].sum() < min_damage_patches:
-                continue
-            
-            processed += 1
-            # print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
-            if save and processed < 1000: save_subgraphs(X_sub, y_sub, subgraph_size, i, j) # Save the subgraph visualization to PDF
+            # From day9 -> day10
+            result2 = create_subgraph(i, x_end, j, y_end, X_day2, y_day3)
+            if result2 is not None:
+                subgraphs.append(result2)
+                processed += 1
 
-            # Flatten features and labels.
-            X_flat = X_sub.reshape(-1, 4)  # 4 features per node.
-            y_flat = y_sub.reshape(-1)
+            if processed % 100 == 0:
+                print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
 
-            subgraphs.append(Data(
-                x=torch.FloatTensor(X_flat),
-                edge_index=edge_index,
-                y=torch.FloatTensor(y_flat)
-            ))
-            
-        gc.collect() # Free memory after each subgraph
+        gc.collect()
 
-    print(f"Created {len(subgraphs)} subgraphs of size {subgraph_size}x{subgraph_size} with {subgraph_size/stride}% overlap.")
+    print(f"Created {len(subgraphs)} subgraphs of size {subgraph_size}x{subgraph_size} with {stride/subgraph_size:.2f} overlap.")
     return subgraphs
 
-def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    # device='cpu'
+
+def train_on_subgraphs(subgraph_size, stride, min_damage_patches=5, epochs=50, lr=0.005, early_stop_patience=5):
+    # Specify gpu/cpu/mps usage
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'gpu' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Split data (moved to GPU later)
-    subgraphs = [graph.to(device) for graph in subgraphs]
-    train_data, test_data = train_test_split(subgraphs, test_size=0.4, random_state=42)
-    
+    # Make some subgraphs + the adjacency matrix
+    adj_matrix = build_static_adjacency(
+        patch_grid_shape=(subgraph_size, subgraph_size),
+        neighborhood=8
+    )
+    edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long).to(device)
+    subgraphs = create_subgraphs(subgraph_size=subgraph_size, stride=stride, min_damage_patches=min_damage_patches)
+    if device.type != "cpu": subgraphs = [graph.to(device) for graph in subgraphs]
+
     # Initialize model
-    num_features = train_data[0].x.shape[1]
+    num_features = subgraphs[0].x.shape[1]
     model = FireSpreadGAT(
         num_features=num_features,
         hidden_channels=64,  # Increased capacity
@@ -307,13 +317,15 @@ def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
     criterion = nn.BCELoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2)
     
-    # Convert data to GPU batches
-    def to_dev(batch):
-        print(f"x: {batch.x.device}, edge_index: {batch.edge_index.device}, y: {batch.y.device}")
-        return batch.to(device)
-    
-    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, collate_fn=to_dev)
-    test_loader = DataLoader(test_data, batch_size=64, shuffle=False, collate_fn=to_dev)
+    # # Convert data to GPU batches
+    # def to_dev(batch):
+    #     print(f"x: {batch.x.device}, edge_index: {batch.edge_index.device}, y: {batch.y.device}")
+    #     return batch.to(device)
+
+    # Split data
+    train_data, test_data = train_test_split(subgraphs, test_size=0.4, random_state=42)
+    train_loader = DataLoader(train_data, batch_size=32, shuffle=True) # if GPU: collate_fn=to_dev
+    test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
 
     # Training loop
     best_loss = float('inf')
@@ -322,10 +334,15 @@ def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0
+
+        # === Start timers and memory profiling ===
+        start_time = time.time()
+        process = psutil.Process()
+        cpu_mem_before = process.memory_info().rss / (1024 ** 2)  # in MB
         
-        for data in train_loader:
-            data.x = data.x.to(device)
-            data.y = data.y.to(device)
+        for data in train_loader:  
+            data.edge_index = edge_index
+
             optimizer.zero_grad(set_to_none=True)  # More memory efficient
             
             # Forward pass with mixed precision
@@ -336,8 +353,16 @@ def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
             optimizer.step()
-            
             epoch_loss += loss.item()
+
+            # Run garbage collector
+            gc.collect()
+
+        # === End timers and memory usage ===
+        end_time = time.time()
+        epoch_time = end_time - start_time
+        cpu_mem_after = process.memory_info().rss / (1024 ** 2)  # in MB
+        cpu_mem_used = cpu_mem_after - cpu_mem_before
         
         # Validation
         model.eval()
@@ -346,11 +371,12 @@ def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
         
         with torch.no_grad():
             for data in test_loader:
+                data.edge_index = edge_index
                 out = model(data).squeeze()
                 val_loss += criterion(out, data.y.squeeze()).item()
                 y_true.extend(data.y.cpu().tolist())
                 y_pred.extend((out > 0.5).float().cpu().tolist())
-        
+
         # Metrics
         avg_loss = epoch_loss / len(train_loader)
         avg_val_loss = val_loss / len(test_loader)
@@ -358,14 +384,18 @@ def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
         
         # Calculate metrics
         accuracy = accuracy_score(y_true, y_pred)
+        recall = recall_score(y_true, y_pred)
         f1 = f1_score(y_true, y_pred)
         
         print(f'Epoch {epoch+1:03d} | '
               f'Train Loss: {avg_loss:.6f} | '
               f'Val Loss: {avg_val_loss:.6f} | '
               f'Acc: {accuracy:.4f} | '
-              f'F1: {f1:.4f}')
-        
+              f'Recall: {recall:.4f} | '
+              f'F1: {f1:.4f} | '
+              f'Time: {epoch_time:.2f}s | '
+              f'CPU ΔMem: {cpu_mem_used:.2f}MB')
+
         # Early stopping
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
@@ -377,7 +407,6 @@ def train_on_subgraphs(subgraphs, epochs=50, lr=0.001, early_stop_patience=5):
                 print(f"Early stopping at epoch {epoch+1}")
                 break
         
-        # Memory cleanup
         gc.collect()
 
     # Load best model
@@ -411,76 +440,19 @@ class FireSpreadGAT(nn.Module):
         x = self.fc(x)
         return torch.sigmoid(x)
 
-# 3. Training and Evaluation
-def train_model(data_list, epochs=100, lr=0.01):
-    # Split data into train and test
-    train_data, test_data = train_test_split(data_list, test_size=0.2, random_state=42)
-    
-    # Create DataLoader
-    train_loader = DataLoader(train_data, batch_size=1, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
-    
-    # Initialize model
-    num_features = train_data[0].x.shape[1]
-    model = FireSpreadGAT(num_features=num_features, hidden_channels=32, num_heads=4)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.BCELoss()
-    
-    # Training loop
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        
-        for data in train_loader:
-            optimizer.zero_grad()
-            out = model(data)
-            loss = criterion(out, data.y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        
-        # Print training progress
-        if (epoch + 1) % 10 == 0:
-            print(f'Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(train_loader):.4f}')
-    
-    # Evaluation
-    model.eval()
-    y_true, y_pred = [], []
-    
-    with torch.no_grad():
-        for data in test_loader:
-            pred = model(data)
-            y_true.extend(data.y.view(-1).tolist())
-            y_pred.extend((pred > 0.5).float().view(-1).tolist())
-    
-    # Calculate metrics
-    accuracy = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred)
-    recall = recall_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
-    
-    print(f'\nTest Metrics:')
-    print(f'Accuracy: {accuracy:.4f}')
-    print(f'Precision: {precision:.4f}')
-    print(f'Recall: {recall:.4f}')
-    print(f'F1 Score: {f1:.4f}')
-    
-    return model
 
-def visualize_predictions(subgraph_size):
-    X_day09, y_day10 = raster_to_tiles("09", patch_size=1)
-    X_day09 = X_day09.reshape(13400, 19500, 4)
-    y_day10 = y_day10.reshape(13400, 19500)
+def visualize_predictions(subgraph_size, day, best_model):
+    X_day1, y_day2 = raster_to_tiles(day, patch_size=1)
 
     # subgraphs = create_subgraphs(X_day1=X_day09, y_day2=y_day10, subgraph_size=100, stride=100, min_damage_patches=0)
 
     model = FireSpreadGAT(
-        num_features=X_day09.shape[2],
+        num_features=X_day1.shape[2],
         hidden_channels=64,  # Increased capacity
         num_heads=4,
         dropout=0.3  # Added regularization
     ).to("cpu")
-    model.load_state_dict(torch.load(f'{data_dir}data/best_model.pt'))
+    model.load_state_dict(torch.load(f'{data_dir}{best_model}'))
     model.eval()
 
     # Create the adjacency matrix for the subgraph (same for every subgraph).
@@ -491,14 +463,14 @@ def visualize_predictions(subgraph_size):
     edge_index = torch.tensor(np.stack(adj_matrix.nonzero()), dtype=torch.long)
 
     # Define stride as half the subgraph size for (1/overlap)% overlap.
-    n_rows, n_cols = X_day09.shape[0], X_day09.shape[1]
+    n_rows, n_cols = X_day1.shape[0], X_day1.shape[1]
 
     # Calculate maximum starting indices to avoid slicing beyond the boundaries.
     max_row_start = n_rows - subgraph_size + 1
     max_col_start = n_cols - subgraph_size + 1
 
     processed = 0
-    full_pred = np.zeros_like(y_day10)
+    full_pred = np.zeros_like(y_day2)
     # Use a sliding window approach
     for i in range(0, max_row_start, subgraph_size):
         for j in range(0, max_col_start, subgraph_size):
@@ -507,7 +479,7 @@ def visualize_predictions(subgraph_size):
             y_end = j + subgraph_size
 
             # Extract the 100x100 subsection with the given overlap.
-            X_sub = X_day09[i:x_end, j:y_end, :]
+            X_sub = X_day1[i:x_end, j:y_end, :]
             
             # Flatten features and labels.
             X_flat = X_sub.reshape(-1, 4)  # 4 features per node.
@@ -522,7 +494,7 @@ def visualize_predictions(subgraph_size):
             pred = (out > 0.5).float()  # Convert to binary predictions
             
             # Store predictions
-            full_pred[i:x_end, j:y_end] = pred.cpu().numpy().reshape(100, 100)
+            full_pred[i:x_end, j:y_end] = pred.cpu().numpy().reshape(subgraph_size, subgraph_size)
 
             print(f"Processed subgraph {processed}: {i}-{x_end}, {j}-{y_end}")
 
@@ -533,7 +505,7 @@ def visualize_predictions(subgraph_size):
     
     # Ground truth
     plt.subplot(1, 3, 1)
-    plt.imshow(y_day10, cmap='Reds')
+    plt.imshow(y_day2, cmap='Reds')
     plt.title('Ground Truth')
     plt.colorbar()
     
@@ -549,10 +521,10 @@ def visualize_predictions(subgraph_size):
     # - Red = True Positive (predicted 1, truth 1)
     # - Blue = False Positive (predicted 1, truth 0)
     # - Green = False Negative (predicted 0, truth 1)
-    comparison = np.zeros((*y_day10.shape, 3))
-    comparison[..., 0] = (full_pred & full_truth)  # Red channel - True positives
-    comparison[..., 1] = (~full_pred.astype(bool) & y_day10)  # Green channel - False negatives
-    comparison[..., 2] = (full_pred.astype(bool) & ~y_day10)  # Blue channel - False positives
+    comparison = np.zeros((*y_day2.shape, 3))
+    comparison[..., 0] = np.logical_and(full_pred, y_day2).astype(np.float32)  # Red channel - True positives
+    comparison[..., 1] = (~full_pred.astype(bool) & y_day2.astype(bool))  # Green channel - False negatives
+    comparison[..., 2] = (full_pred.astype(bool) & ~y_day2.astype(bool))  # Blue channel - False positives
     
     plt.imshow(comparison)
     plt.title('Comparison (TP=Red, FN=Green, FP=Blue)')
@@ -561,39 +533,16 @@ def visualize_predictions(subgraph_size):
     plt.show()
 
 # Directory storing stacked fire inputs
-data_dir = "722_project/"
+data_dir = ""
 
 # Main execution
 if __name__ == "__main__":
 
-    visualize_predictions(subgraph_size=100)
+    # Visualize predictions made by best model
+    visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200.pt')
+    visualize_predictions(subgraph_size=100, day="09", best_model='best_model_200.pt')
     quit(0)
 
-    # Process full dataset: 13454 x 19519
-    X_day1, y_day2 = raster_to_tiles("09", patch_size=1)
-    
-    # Reshape to 2D grid (1300x1900 nodes)
-    X_grid = X_day1.reshape(13400, 19500, 4)
-    y_grid = y_day2.reshape(13400, 19500)
-
-    # plt.figure(figsize=(12, 8))
-    # plt.imshow(X_grid[:, :, 3], cmap='binary', vmin=0, vmax=1)
-    # plt.title(f"Processed Fire Damage (Day 09)")
-    # plt.colorbar(label='Damage (1=burned)')
-    # plt.savefig(f"damage_verification_09.png", dpi=300)
-    # plt.show()
-
-    # plt.figure(figsize=(12, 8))
-    # plt.imshow(y_grid, cmap='binary', vmin=0, vmax=1)
-    # plt.title(f"Processed Fire Damage (Day 10)")
-    # plt.colorbar(label='Damage (1=burned)')
-    # plt.savefig(f"damage_verification_10.png", dpi=300)
-    # plt.show()
-
-    with PdfPages('subgraphs.pdf') as pdf:
-        subgraphs = create_subgraphs(X_grid, y_grid, subgraph_size=100, stride=50, min_damage_patches=10)
-    
     # Train the model
     print("\nTraining model...")
-    model = train_on_subgraphs(subgraphs, epochs=50, lr=0.005)
-    
+    model = train_on_subgraphs(subgraph_size=200, stride=100)
