@@ -3,7 +3,7 @@
 ## Setup Instructions
 
 1. Install Requirements
-   Python Version Used: 3.10
+   Python Version Used: 3.12
     ```bash
     pip install -r requirements.txt
     ```
@@ -33,7 +33,7 @@
     python stack_fire_inputs.py
     ```
 
-8. Train and Validate GNN Model
+8. Train and Validate GNN Model. Note: will take a while to train and produce predictions.
     ```bash
     python gnn.py
     ```
