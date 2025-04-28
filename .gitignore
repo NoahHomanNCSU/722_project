@@ -1,0 +1,35 @@
+# Ignore all .nc and .tif files
+*.nc
+*.tif
+data/*.tif
+
+# Common IDE/Editor files
+.idea/
+.vscode/
+*.code-workspace
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS metadata
+data/.DS_Store
+.DDS_Store
+Thumbs.db
+
+# Ignore PyTorch model checkpoints
+*.pt
+
+# Ignore dataset folders (if you want to exclude entire directories)
+data/datasets/
+
+# Ignore images (optional - remove if you want to keep some)
+*.png
+*.jpg
+*.jpeg
+
+# Ignore local files from your status output
+/mlp.py
+/pinn.py
+/dataset.py

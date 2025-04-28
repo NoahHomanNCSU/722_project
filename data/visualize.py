@@ -3,6 +3,44 @@ import numpy as np
 import rasterio
 from matplotlib.colors import ListedColormap
 
+
+# File paths for each day (you should adjust these)
+days = ["08", "09", "10"]
+file_name = "fire_inputs_2025_01_{}.tif"
+
+def load_fuel_and_damage(file):
+    with rasterio.open(file) as src:
+        fuel = src.read(1)[:-2000, 5000:]     # Vegetation/fuel map
+        damage = src.read(4)[:-2000, 5000:]    # Fire damage map
+    return fuel, damage
+
+# Load data
+fuel_08, damage_08 = load_fuel_and_damage(file_name.format(days[0]))
+fuel_09, damage_09 = load_fuel_and_damage(file_name.format(days[1]))
+fuel_10, damage_10 = load_fuel_and_damage(file_name.format(days[2]))
+
+# Create figure
+fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+
+# Custom colormaps
+vegetation_cmap = ListedColormap(['#f0f0f0', '#d9f2a2', '#8cc269'])  # Light green gradient
+fire_cmap = ListedColormap(['#00000000', '#ff0000'])  # Transparent to bright red
+
+for ax, day, damage in zip(axs, days, [damage_08, damage_09, damage_10]):
+    # Plot vegetation (light green)
+    ax.imshow(fuel_08, cmap=vegetation_cmap, vmin=0, vmax=1)
+    
+    # Plot fire damage (bright solid red)
+    fire_mask = damage > 0.1  # Adjust threshold as needed
+    ax.imshow(fire_mask, cmap=fire_cmap, alpha=1.0, interpolation='none')
+    
+    ax.set_title(f"January {day}", fontsize=12, pad=10)
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
 # Load data
 day = "08"
 input_file = f"fire_inputs_2025_01_{day}.tif"
