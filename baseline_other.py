@@ -1,5 +1,3 @@
-baseline_other.py:
-
 import numpy as np
 import rasterio
 import torch
