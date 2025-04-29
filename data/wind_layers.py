@@ -45,4 +45,4 @@ for day in days:
     wind_stack.rio.write_crs("EPSG:4326", inplace=True)
     wind_stack.rio.to_raster(f"wind_2025_01_{day}.tif")
 
-    print(f"✅ Saved: wind_2025_01_{day}.tif")
+    print(f"Saved: wind_2025_01_{day}.tif")
