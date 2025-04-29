@@ -19,7 +19,7 @@ import time
 
 
 # Directory storing stacked fire inputs
-DATA_DIR = "722_project/"
+DATA_DIR = ""
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -259,7 +259,7 @@ def create_subgraphs(day, subgraph_size, stride, min_damage_patches):
             X_sub = X_day1[i:x_end, j:y_end, :]
             y_sub = y_day2[i:x_end, j:y_end]
 
-            if X_sub[:, :, 3].sum() < min_damage_patches:
+            if y_sub[:, :].sum() < min_damage_patches:
                 continue
             
             X_flat = torch.from_numpy(X_sub.reshape(-1, 4).astype(np.float32))
@@ -282,7 +282,7 @@ def create_subgraphs(day, subgraph_size, stride, min_damage_patches):
     return subgraphs
 
 
-def train_on_subgraphs(day, subgraph_size, stride, min_damage_patches=5, epochs=50, lr=0.005, early_stop_patience=5):
+def train_on_subgraphs(day, subgraph_size, stride, min_damage_patches=5, epochs=20, lr=0.005, early_stop_patience=5):
     # Specify gpu/cpu/mps usage
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -464,8 +464,8 @@ def visualize_predictions(subgraph_size, day, best_model):
     processed = 0
     full_pred = np.zeros_like(y_day2)
     # Use a sliding window approach
-    for i in range(0, max_row_start, 200):
-        for j in range(0, max_col_start, 200):
+    for i in range(0, max_row_start, subgraph_size):
+        for j in range(0, max_col_start, subgraph_size):
             # Define the subgraph boundaries.
             x_end = i + subgraph_size
             y_end = j + subgraph_size
@@ -530,21 +530,61 @@ def visualize_predictions(subgraph_size, day, best_model):
 # Main execution
 if __name__ == "__main__":
 
+    # from data.visualize import compare_prediction_to_initial
+    # compare_prediction_to_initial("08","pred_best_model_200_08.pt_09.npy")
+
+
     # Train the model
     print("\nTraining model: day 08 -> 09, subgraph size 100")
     train_on_subgraphs(day="08", subgraph_size=100, stride=50)
 
-    # print("\nTraining model: day 09 -> 10, subgraph size 100")
-    # train_on_subgraphs(day="09", subgraph_size=100, stride=50)
+    print("\nTraining model: day 09 -> 10, subgraph size 100")
+    train_on_subgraphs(day="09", subgraph_size=100, stride=50)
 
-    # print("\nTraining model: day 08 -> 9, subgraph size 200")
-    # train_on_subgraphs(day="08", subgraph_size=200, stride=50)
+    print("\nTraining model: day 08 -> 9, subgraph size 200")
+    train_on_subgraphs(day="08", subgraph_size=200, stride=50)
 
-    # print("\nTraining model: day 9 -> 10, subgraph size 200")
-    # train_on_subgraphs(day="09", subgraph_size=200, stride=50)
+    print("\nTraining model: day 9 -> 10, subgraph size 200")
+    train_on_subgraphs(day="09", subgraph_size=200, stride=50)
 
     # Visualize predictions made by best model
-    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_100_08.pt')
-    # visualize_predictions(subgraph_size=100, day="09", best_model='best_model_100_09.pt')
-    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200_08.pt')
-    # visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200_08.pt')
+    visualize_predictions(subgraph_size=100, day="08", best_model='best_model_100_08.pt')
+    visualize_predictions(subgraph_size=100, day="09", best_model='best_model_100_09.pt')
+    visualize_predictions(subgraph_size=100, day="08", best_model='best_model_200_08.pt')
+    visualize_predictions(subgraph_size=100, day="09", best_model='best_model_200_08.pt')
+
+    # full_pred =  np.load("pred_best_model_200_08.pt_10.npy")
+    # _, y_day2 = raster_to_tiles("09", patch_size=1)
+    # # Create visualization
+    # plt.figure(figsize=(15, 5))
+    
+    # # Ground truth
+    # plt.subplot(1, 3, 1)
+    # plt.imshow(y_day2, cmap='Reds')
+    # plt.title('Ground Truth')
+    # plt.colorbar()
+    
+    # # Predictions
+    # plt.subplot(1, 3, 2)
+    # plt.imshow(full_pred, cmap='Reds')
+    # plt.title('Model Predictions')
+    # plt.colorbar()
+    
+    # # Overlay comparison
+    # plt.subplot(1, 3, 3)
+    # # Create RGB image where:
+    # # - Red = True Positive (predicted 1, truth 1)
+    # # - Blue = False Positive (predicted 1, truth 0)
+    # # - Green = False Negative (predicted 0, truth 1)
+    # comparison = np.zeros((*y_day2.shape, 3))
+    # comparison[..., 0] = (full_pred.astype(bool) & y_day2.astype(bool))  # Red channel - True positives
+    # comparison[..., 1] = (~full_pred.astype(bool) & y_day2.astype(bool))  # Green channel - False negatives
+    # comparison[..., 2] = (full_pred.astype(bool) & ~y_day2.astype(bool))  # Blue channel - False positives
+    
+    # plt.imshow(comparison)
+    # plt.title('Comparison (TP=Red, FN=Green, FP=Blue)')
+    
+    # plt.tight_layout()
+    # plt.show()
+
+
