@@ -1,6 +1,5 @@
 # Urban Fire Spread Prediction Using Graph Attention Networks
 
-## Fire Spread Progression
 The image below illustrates the progression of the Palisades fire in Los Angeles over a three-day period.
 ![Fire Spread Over Three Days](readme_images/Fire_Damage_Spread.png)
 
