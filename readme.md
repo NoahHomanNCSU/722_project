@@ -4,6 +4,7 @@ The image below illustrates the progression of the Palisades fire in Los Angeles
 ![Fire Spread Over Three Days](readme_images/Fire_Damage_Spread.png)
 
 This project uses a Graph Attention Network (GAT) to predict urban fire spread during the Palisades fire.
+
 **Model Input:**
 - Fire damage on Day 1
 - Wind magnitudes in the x and y directions
